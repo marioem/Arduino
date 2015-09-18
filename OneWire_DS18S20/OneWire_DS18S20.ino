@@ -83,5 +83,3 @@ void loop(void) {
   Serial.println(temperature,4);
 }
 
-
-

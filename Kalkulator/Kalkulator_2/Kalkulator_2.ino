@@ -215,20 +215,3 @@ void changeSign(double *op, int _state) {
     lcd.write('.');
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

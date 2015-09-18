@@ -229,29 +229,3 @@ void clearcdd() {
   positive = true;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

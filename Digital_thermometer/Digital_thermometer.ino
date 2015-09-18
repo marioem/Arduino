@@ -160,14 +160,3 @@ char *convTemp(float temperature)
   return tempString;
 }
 
-
-
-
-
-
-
-
-
-
-
-
