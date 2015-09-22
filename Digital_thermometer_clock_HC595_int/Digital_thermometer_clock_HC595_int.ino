@@ -411,7 +411,7 @@ void LC4LEDDisplayMemWrite(char *digits, byte *displayBuf)
   len--;
   if(len > 8 || len < 4)
   {
-    error = truetrue;
+    error = true;
     goto error;
   }
   for(int i = 0; i < len; i++)
