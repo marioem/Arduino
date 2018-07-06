@@ -89,7 +89,7 @@
  *  - build data strings for logging to SD card
  *  
  *  Code is writen with preprocessor directives conditional on two #define constants: A_UNO and DEBUGMODE.
- *  If A_UNO is defined it means the program is compiled fro UNO board, consequently as Serial us used to interface WiFi module, to connect monitor
+ *  If A_UNO is defined it means the program is compiled for UNO board, consequently as Serial us used to interface WiFi module, to connect monitor
  *  for debugging purposes a SW Serial over FTDI is used. If it is undefined then program is compiled for MEGA board and Serial is available for monitor.
  *  If DEBUGMODE is defined then code printing debug info to the monitor is enabled/included.
  *  
