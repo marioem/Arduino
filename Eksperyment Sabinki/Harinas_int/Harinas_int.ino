@@ -1,3 +1,4 @@
+
 /*
  * SD circuit:
  * SD card attached to SPI bus as follows UNO (MEGA):
@@ -10,6 +11,10 @@
  * ESP8266 connected via UART UNO (MEGA):
  ** ESP RX - pin 1 (19)
  ** ESP TX - pin 0 (18)
+ * 
+ * For UNO it is Serial port, for MEGA it is Serial1.
+ * Because on UNO this port is also used by USB to download code and to connect Monitor,
+ * so in order to be able to have a debugging monitor a SW Serial via FTDI is used, see below.
  * 
  * Display module attached to I2C via PFC8574 (address 0x39)
  * Heater control attached to I2C via PFC8574 (address 0x38)
@@ -26,10 +31,76 @@
  ** D3 - BACKLIGHT (6)
  ** D5...D7 - D5...D7 (11..14)
  * 
- * Beeper
+ *  LCD information layout:
+ *  
+ *  Row 0: [Heaters status] [Time]
+ *  Row 1: [Temp. alarms]   [System alarms] [ThingSpeak update interval counter]
+ *  
+ *  Example:
+ *  Row 0:  ***__* HH:MM:SS
+ *  Row 1: _AAA__A lwhsr 26
+ *  Cols:  0123456789012345
+ *         0         1 
+ *         
+ *  Heaters status:
+ *    * - heater on
+ *    _ - heater off
+ *    
+ *  Temperature alarms:
+ *    _ - No alarm
+ *    A - Temperaure out of range alarm
+ *    
+ *  System alarms:
+ *    l - LCD no alarm
+ *    L - LCD error
+ *    w - WiFi no alarm
+ *    W - WiFi error
+ *    h - Heaters no alarm
+ *    H - Heaters error
+ *    s - SD card no alarm
+ *    S - SD card error
+ *    r - RTC no alarm
+ *    R - RTC error
+ *    
+ * Beeper 
  ** pin 3
  *
+ * HW setup
+ * ========
+ * Main controller Arduino MEGA due to more SRAM memory available. With UNO it was frequent that the data memory and stack
+ * started to overwrite each other causing program to crash.
+ * 
+ * Arduino MEGA controlling:
+ *    WiFi ESP8266 module over UART1, using AT commands
+ *    LCD display over I2C and PCF8574
+ *    Heaters over I2C and PCF8574 and steering heaters through ULN2803A
+ *    RTC module over I2C
+ *    SD card module over SPI interface
+ *    7 DS18B20 One Wire digital termometers
+ *    Buzzer over digital out pin
+ *    
+ * SW structure
+ * ============
+ * Due to limited data memory size on UNO program memory is used to store a number of string constants. Those constants are used
+ * to:
+ *  - build AT commands for WiFi module
+ *  - provide debug info over Monitor interface
+ *  - build info strings send to ThingSpeak
+ *  - build data strings for logging to SD card
+ *  
+ *  Code is writen with preprocessor directives conditional on two #define constants: A_UNO and DEBUGMODE.
+ *  If A_UNO is defined it means the program is compiled fro UNO board, consequently as Serial us used to interface WiFi module, to connect monitor
+ *  for debugging purposes a SW Serial over FTDI is used. If it is undefined then program is compiled for MEGA board and Serial is available for monitor.
+ *  If DEBUGMODE is defined then code printing debug info to the monitor is enabled/included.
+ *  
+ *  The entire process is handled within the main loop function. See its comments for details.
+ *  
+ *  The SQW-triggered interrupt, occurring every 1 second is used to update the time display on the LCD.
+ *  
+ *  
  */
+
+ 
 #define DEBUGMODE // enables printing out diagnostic info to terminal
 
 // Select platform (if not defined A_UNO Arduino MEGA is assumed)
@@ -46,6 +117,11 @@
 #ifdef A_UNO
   #include <SoftwareSerial.h>
 #endif
+
+#include <Time.h>
+#include <TimeLib.h>
+
+
 #include <DS1307RTC.h>
 
 // LCD stuff
@@ -75,7 +151,7 @@ LiquidCrystal_PCF8574 lcd(LCDADDR);
 #define HEATERADDR 0x38
 
 const byte tempLimits[6] =  {15, 20, 25, 30, 35, 40};  // values of the temperatures to maintain in each box
-byte heater = 0;  // global var sent to PCF controlling the state of the heaters.
+byte heater = 0;  // global var sent to PCF controlling the state of the heaters. Each bit controls one heater. 1 - heater on, 0 - heater off
 
 #define HYSTHIGH    0.35  // hysteresis for temperature control, upper
 #define HYSTLOW    -0.14  // hysteresis for temperature control, lower. Due to thermal inertia we need to control always above the required temperature
@@ -95,11 +171,11 @@ byte heater = 0;  // global var sent to PCF controlling the state of the heaters
 // Data wire is plugged into port 2 on the Arduino
 #define ONE_WIRE_BUS 2
 #define TEMPERATURE_PRECISION 11
-#define SENSOR_COUNT 7
+#define SENSOR_COUNT 7  // six boxes and the external temp sensor
 
 byte tAlarms = 0;   // temperature alarms for the heater thermometers (0-5)
 
-#define T7AL 6
+#define T7AL 6      // bit number for external temperature sensor alarm
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(ONE_WIRE_BUS);
@@ -251,7 +327,7 @@ char buffer[128], buffer2[100], buffer3[8];
 
 byte cnt = 0, logdata = 0;
 
-byte sAlarms = 0;      // system alarms flags. Updated also in the int_sqw() interrupt routine
+byte sAlarms = 0;      // system alarms flags. Updated also in the int_sqw() interrupt routine. This is why the Alarm() is surrounded by cli/sei
                        // Bits:
                        // 4 - LCD
                        // 3 - WiFi
@@ -263,26 +339,46 @@ char alarmStr[8];
 byte wifiDelayCnt = 0; // counter used to count 1 minute intervals to update ThingSpeak
 byte buzzDelayCnt = 0; // counter used to count 29s of pause between alarm beeps.
 
+
+
+//*****************************************************************
+//      ##   #####  #####  #   #  ####
+//     #  #  #        #    #   #  #   #
+//      #    #        #    #   #  #   #
+//       #   ###      #    #   #  ####
+//        #  #        #    #   #  #
+//    #  #   #        #    #   #  #
+//     ##    #####    #     ###   #
+//*****************************************************************
+
 void setup(void)
 {
   byte i = 0;
-
+  //****************************Buzzer*****************************
+  // Setup Buzzer pin
+  //
   pinMode(BUZZERPIN, OUTPUT);
   digitalWrite(BUZZERPIN, LOW);
   
+  //****************************Serial****************************
   // start serial port
-  Serial.begin(115200);
+  // Used for communication with WiFi module
+  //
+  Serial.begin(115200);   // MEGA - USB, Monitor; UNO - USB & WIFI
 #if !defined(A_UNO)
-  Serial1.begin(115200);
+  Serial1.begin(115200);  // MEGA - WIFI
 #endif
 
 #ifdef DEBUGMODE
   #ifdef A_UNO
-    monitor.begin(57600);
+    monitor.begin(57600); // UNO - Monitor
   #endif
 #endif
 
+  //****************************LCD*******************************
+  //
   // initialize LCD with number of columns and rows: 
+  //
 #ifdef DEBUGMODE
   printMonit(STR_LCDINIT);
 #endif
@@ -304,8 +400,14 @@ void setup(void)
   lcdMonit(STR_START, 0, 0, true);
   delay(700);
 
+  //*****************************RTC SQW***************************
+  // Init SQW on RTC
+  //
   RTCSquareWave(SQ_1HZ);  // Initialize 1 Hz square wave output from RTC, so that it can drive the external interrupt
 
+  //*****************************Heaters***************************
+  // Init Heaters
+  //
 #ifdef DEBUGMODE
   printMonit(STR_HEATERINIT);
 #endif
@@ -329,8 +431,10 @@ void setup(void)
     lcdMonit(STR_HEATEROK, 0, 0, true);
     delay(700);
   }
-    
-  // initialize and conenct wifi
+
+  //******************************WIFI****************************
+  // Initialize and conenct wifi
+  //
 #ifdef DEBUGMODE
   printMonit(STR_WIFIINIT);
 #endif
@@ -345,7 +449,9 @@ void setup(void)
 #endif
   lcdMonit(STR_SDINIT, 0, 0, true);
 
+  //*****************************SD Card***************************
   // see if the card is present and can be initialized:
+  //
   if (!SD.begin(CHIPSELECT)) {
     cli();
     Alarm(&sAlarms, SALSD, ALARMSET);
@@ -361,7 +467,10 @@ void setup(void)
     lcdMonit(STR_SDOK, 0, 0, true);
   }
   delay(700);
-  
+
+  //**************************Thermometers*************************
+  // Init temperature sensors
+  //
 #ifdef DEBUGMODE
   printMonit(STR_SENSINIT);
 #endif
@@ -377,21 +486,275 @@ void setup(void)
 
   delay(700);
 
+  //************************INIT COMPLETE***************************
+  // Init completed, print information to LCD
+  //
   lcd.clear();
   lcdMonit(STR_INITDONE, 0, 0, true);
 
   delay(1000);
 
+  //*****************Display status info to LCD*********************
+  // Display temp and system alarm information
+  //
   lcdPrint(heaterString(), HEATERCOL, HEATERROW, true);
   tAlarmPrint();
   sAlarmPrint();
 
+  //*************************RTC SQW INT init***********************
   // Init interrupt driven by RTC SQ output
+  //
   pinMode(SQW_INT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(SQW_INT_PIN), int_sqw, FALLING);
 
 }
 
+//*****************************************************************
+//                     #       ###    ###   ####
+//                     #      #   #  #   #  #   #
+//                     #      #   #  #   #  #   #
+//                     #      #   #  #   #  ####
+//                     #      #   #  #   #  #
+//                     #      #   #  #   #  #
+//                     #####   ###    ###   #
+//
+//*****************************************************************
+//
+// loop tasks:
+//  - increment and print wifi update delay counter
+//  - read temperatures
+//  - raise temp alarms if temperatres outside allowed ranges
+//  - update heater controls
+//  - read date and time
+//  - log temps and heaters status to file on SD every 2 seconds
+//  - Update ThingSpeak every minute
+//  - update alarm information on LCD
+//  - activate buzzer if any alarm active
+//
+//  The loop function is timed to be spaced each run at least 1s apart
+//*****************************************************************
+void loop(void)
+{ 
+#ifdef DEBUGMODE
+  unsigned long time1, timediff;
+#endif
+  float temps[SENSOR_COUNT];
+  byte i;
+  File dataFile;
+
+  //*****************************************************************
+  // Update wifi delay counter on LCD
+  //
+  lcd.setCursor(CNTCOL, CNTROW);
+  if(wifiDelayCnt < 10) {
+    lcd.print(" ");
+  }
+  lcd.print(wifiDelayCnt);
+  
+  // call sensors.requestTemperatures() to issue a global temperature 
+  // request to all devices on the bus
+
+#ifdef DEBUGMODE
+  printMonit(STR_REQTEMPC);
+  time1 = millis();
+#endif
+
+  //*****************************************************************
+  // initiate temps reading
+  //
+  sensors.requestTemperatures();
+
+#ifdef DEBUGMODE
+  timediff = millis() - time1;  
+  printMonit(STR_DONE);
+  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_CONVTIME])));
+  #if defined(A_UNO)
+    monitor.print(buffer);
+    monitor.println(timediff);
+  #else
+    Serial.print(buffer);
+    Serial.println(timediff);
+  #endif
+#endif
+
+#ifdef DEBUGMODE
+  // print the device information -- debug only
+  for(i = 0; i < SENSOR_COUNT; i++)
+    printData(Thermometer[i]);
+#endif
+
+  //*****************************************************************
+  // Read temps and update temp alarm statuses
+  //
+  for(i = 0; i < SENSOR_COUNT; i++) {
+    temps[i] = sensors.getTempC(Thermometer[i]);
+    if(i < SENSOR_COUNT - 1) {           // Box 1 to 6 sensors
+      if(temps[i] > tempLimits[i] + TEMPMARGIN || temps[i] < tempLimits[i] - TEMPMARGIN)
+        Alarm(&tAlarms, i, ALARMSET);
+      else
+        Alarm(&tAlarms, i, ALARMCLEAR);
+    } else {                          // ext temp sensor
+      if(abs(temps[i]) > TEMPLIM)
+        Alarm(&tAlarms, i, ALARMSET);
+      else
+        Alarm(&tAlarms, i, ALARMCLEAR);
+    }
+  }
+
+  //*****************************************************************
+  // update heater controls in function of the temp readings
+  //
+  heaterControl(temps);
+  lcdPrint(heaterString(), HEATERCOL, HEATERROW, false);
+
+  //*****************************************************************
+  // build strings for data logging
+  //
+  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_DATALOG])));
+  if(!SD.exists(buffer)) {
+    strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_HEADERS])));
+  }
+  else {
+    strcpy(buffer, "");
+  }
+  
+//  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_DATETIME])));
+//  strcat(buffer, buffer2);
+
+  //*****************************************************************
+  // Read date and time
+  //
+  cli();
+  strcat(buffer, rtcDate);
+  sei();
+  strcat(buffer, ",");
+  cli();
+  strcat(buffer, rtcTime);
+  sei();
+  
+  //*****************************************************************
+  // prepare temperatures for the log
+  //
+  for(i = 0; i < SENSOR_COUNT; i++) {
+    strcat(buffer, ",");
+    strcat(buffer, dtostrf(temps[i], -5, 2, buffer2));
+  }
+
+  //*****************************************************************
+  // prepare heater states for the log
+  //
+  for(i = 0; i < SENSOR_COUNT - 1; i++) {
+    strcat(buffer, ",");
+    strcat(buffer, itoa((heater >> i) & 0x01, buffer2, 10));
+  }
+  
+  //*****************************************************************
+  // Write data to the log. Every 2 seconds, approximately.
+  // open the file. Note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  //
+  if(logdata > 0) { // log every 2 * DELAY ms
+    logdata = 0;
+    strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_DATALOG])));
+  
+    dataFile = SD.open(buffer2, FILE_WRITE);
+    // if the file is available, write to it:
+    if (dataFile) {
+      dataFile.println(buffer);
+      dataFile.close();
+      cli();
+      Alarm(&sAlarms, SALSD, ALARMCLEAR);
+      sei();
+#ifdef DEBUGMODE
+  #if defined(A_UNO)
+      monitor.println(buffer);
+  #else
+      Serial.println(buffer);
+  #endif
+#endif
+    } else {  // if the file isn't open, pop up an error:
+      cli();
+      Alarm(&sAlarms, SALSD, ALARMSET);
+      sei();
+#ifdef DEBUGMODE
+      printMonit(STR_DATALOGERR);
+#endif
+    }
+  } else {
+    logdata++;
+  }
+
+  if(bitRead(sAlarms, SALWIFI) == ALARMSET) {
+    wifiInit(WIFILOOP);   // try to recover wifi
+  }
+  
+  //*****************************************************************
+  // Update ThingsSpeak every minute
+  //
+  if(wifiDelayCnt >= (THINGSPEAKINTERVAL - 2000) / DELAY && bitRead(sAlarms, SALWIFI) == ALARMCLEAR) {
+    wifiDelayCnt = 0;
+
+    // Build update string. String format;
+    // "GET /update?key=8ABPRZYZOPS96160&field0=temp0&field1=temp1&field2=temp2&field3=temp3&field4=temp4&field5=temp5&field6=temp6&field7=temp7\r\n"
+    //
+    strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_GET])));
+    strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_FIELD])));
+    
+    for(i = 0; i < SENSOR_COUNT; i++) {
+      strcat(buffer, buffer2);
+      strcat(buffer, itoa(i + 1, buffer3, 10));
+      strcat(buffer, "=");
+      strcat(buffer, dtostrf(temps[i], -5, 2, buffer3));
+    }
+    strcat(buffer, "\r\n");
+#ifdef DEBUGMODE
+  #if defined(A_UNO)
+    monitor.println(buffer);
+  #else
+    Serial.println(buffer);
+  #endif
+#endif    
+    updateTemp(buffer);       // Takes the payload string, initiates the trasmission and sends it
+  }
+
+
+  //*****************************************************************
+  // Update alarm info on LCD
+  //
+  tAlarmPrint();
+  sAlarmPrint();
+  
+  //*****************************************************************
+  // If any alarm active activate buzzer for 1 second every 30 seconds
+  //
+  if(buzzDelayCnt == 0 && (tAlarms != 0 || sAlarms != 0)) {
+    digitalWrite(BUZZERPIN, HIGH);
+  }
+  if(tAlarms != 0 || sAlarms != 0) {
+    buzzDelayCnt++;         // increment counter only if any of the alarms is active
+    if(buzzDelayCnt == BUZZERINTERVAL / DELAY)
+      buzzDelayCnt = 0;
+  } else {
+    buzzDelayCnt = 0;
+  }
+  
+  delay(DELAY);
+
+  digitalWrite(BUZZERPIN, LOW);
+
+  wifiDelayCnt++;
+  cnt++;
+}
+// End of loop function
+
+
+//************************************************************************* LCD routines ******************
+
+//**************************** lcdMonit ***************************
+// Print the progress info to the LCD.
+// Used during initialization phase. The index to a string to be
+// printed is passed as an argument. String is located in progmem
+//
 void lcdMonit(int strIdx, byte row, byte col, bool clr) {
   if(clr)
     lcd.clear();
@@ -400,6 +763,10 @@ void lcdMonit(int strIdx, byte row, byte col, bool clr) {
   lcd.print(buffer);
 }
 
+//**************************** lcdPrint ***************************
+// A general LCD print routine. String to be printed is passed as
+// an argument.
+//
 void lcdPrint(char* msg, byte col, byte row, bool clr) {
   if(clr)
     lcd.clear();
@@ -407,8 +774,16 @@ void lcdPrint(char* msg, byte col, byte row, bool clr) {
   lcd.print(msg);
 }
 
-#ifdef DEBUGMODE
 
+
+
+
+#ifdef DEBUGMODE //************************************************ DEBUG code start ****************
+
+//**************************** printMonit ***************************
+// Print a diagnostic string to serial monitor. String index is passed
+// as an argument.
+//
 void printMonit(int strIdx) {
   strcpy_P(buffer, (char*)pgm_read_word(&(string_table[strIdx])));
 #if defined(A_UNO)
@@ -418,6 +793,15 @@ void printMonit(int strIdx) {
 #endif
 }
 
+//******************* Print temp sensors info ***********************
+// Three funtions used to print the sensors reading and addresses to the
+// serial monitor:
+//      printData
+//          printAddress
+//          printTemperature
+//
+//************************* printAddress ****************************
+// 
 void printAddress(DeviceAddress deviceAddress)
 {
   for (byte i = 0; i < 8; i++) {
@@ -429,7 +813,7 @@ void printAddress(DeviceAddress deviceAddress)
       Serial.print("0");
 #endif
 
-#if defined(A_UNO)
+#if defined(A_UNO)                              // merge with above
     monitor.print(deviceAddress[i], HEX);
 #else
     Serial.print(deviceAddress[i], HEX);
@@ -437,8 +821,10 @@ void printAddress(DeviceAddress deviceAddress)
   }
 }
 
-// function to print the temperature for a device
+//********************* printTemperature ***************************
+// Function to print the temperature for a device
 // Only in debug mode
+//
 void printTemperature(DeviceAddress deviceAddress)
 {
   float tempC = sensors.getTempC(deviceAddress);
@@ -453,7 +839,9 @@ void printTemperature(DeviceAddress deviceAddress)
 #endif
 }
 
+//**************************** printData ***************************
 // main function to print information about a device
+//
 void printData(DeviceAddress deviceAddress)
 {
   strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_DEVADDR])));
@@ -476,94 +864,84 @@ void printData(DeviceAddress deviceAddress)
 #endif
 }
 
-#endif
+#endif    //************************************************ DEBUG code end ******************
 
-void updateTemp(char* fields){
-  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_CIPSTART])));
-  sendDebug1(buffer2);
-  delay(2000);
-  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_ERROR])));
+
+
+//************************************************************************* WiFi routines *****************
+
+
+//************************** wifiInit ********************************
+// Initialize Wifi module
+//********************************************************************
+
+void wifiInit(byte mode) {
+
+//  wifiRST();
+  
+  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_AT])));
+  sendWiFi(buffer);
+  
+  delay(5000);
+
+  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_OK])));
 #if defined(A_UNO)
-  if(Serial.find(buffer2)){
+  if(Serial.find((char*)"OK")){
 #else
-  if(Serial1.find(buffer2)){
+  if(Serial1.find((char*)"OK")){
 #endif
-    cli();
-    Alarm(&sAlarms, SALWIFI, ALARMSET);
-    sei();
-#ifdef DEBUGMODE
-    printMonit(STR_RECERR);
-#endif
-    return;
-  }
-  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_CIPSEND])));
-#if defined(A_UNO)
-  Serial.print(buffer2);
-  Serial.println(strlen(fields));
-  if(Serial.find(">")){
-#else
-  Serial1.print(buffer2);
-  Serial1.println(strlen(fields));
-  if(Serial1.find(">")){
-#endif
-#ifdef DEBUGMODE
-  #if defined(A_UNO)
-    monitor.print(">");
-    monitor.print(fields);
-  #else
-    Serial.print(">");
-    Serial.print(fields);
-  #endif
-#endif
-#if defined(A_UNO)
-    Serial.print(fields);
-#else
-    Serial1.print(fields);
-#endif
-  }else{
-    strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_CIPCLOSE])));
-    sendDebug1(buffer2);
-  }
-  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_OK])));
-#if defined(A_UNO)
-  if(Serial.find(buffer2)){
-#else
-  if(Serial1.find(buffer2)){
-#endif
-    cli();
-    Alarm(&sAlarms, SALWIFI, ALARMCLEAR);
-    sei();
 #ifdef DEBUGMODE
     printMonit(STR_RECOK);
 #endif
-  }else{
+    if(connectWiFi()) {
+      if(mode == WIFISETUP)
+        lcdMonit(STR_WIFIOK, 0, 0, true);
+      cli();
+      Alarm(&sAlarms, SALWIFI, ALARMCLEAR);
+      sei();
+#ifdef DEBUGMODE
+      printMonit(STR_WIFIOK);
+#endif  
+    } else {
+      if(mode == WIFISETUP)
+        lcdMonit(STR_WIFIERR, 0, 0, true);
+      cli();
+      Alarm(&sAlarms, SALWIFI, ALARMSET);
+      sei();
+#ifdef DEBUGMODE
+      printMonit(STR_WIFIERR);
+#endif  
+    }
+  } else {
+    if(mode == WIFISETUP)
+      lcdMonit(STR_WIFIERR, 0, 0, true);
     cli();
     Alarm(&sAlarms, SALWIFI, ALARMSET);
     sei();
 #ifdef DEBUGMODE
-    printMonit(STR_RECERR);
+    printMonit(STR_WIFIERR);
 #endif
-  }
+  }  
 }
- 
- void sendDebug1(char* cmd){
-#ifdef DEBUGMODE
-  strcpy_P(buffer3, (char*)pgm_read_word(&(string_table[STR_SEND])));
-  #if defined(A_UNO)
-    monitor.print(buffer3);
-    monitor.println(cmd);
-  #else
-    Serial.print(buffer3);
-    Serial.println(cmd);
-  #endif
-#endif
-#if defined(A_UNO)
-  Serial.println(cmd);
-#else
-  Serial1.println(cmd);
-#endif
-} 
- 
+
+
+//*************************** wifiRST ********************************
+// HW-reset Wifi module
+//********************************************************************
+
+void wifiRST() {
+  pinMode(WIFIRSTPIN, OUTPUT);
+  digitalWrite(WIFIRSTPIN, LOW);
+  delay(500);
+  digitalWrite(WIFIRSTPIN, HIGH);
+  delay(2000);
+}
+
+
+//*************************** connectWiFi ****************************
+// Connect Wifi module to the AP/Router
+//********************************************************************
+
 boolean connectWiFi(){
   strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_CWMODE])));
 #if defined(A_UNO)
@@ -605,184 +983,110 @@ boolean connectWiFi(){
   }
 }
 
-void loop(void)
-{ 
+
+//****************************** sendWiFi ****************************
+// Send buffer to Wifi module
+//********************************************************************
+
+void sendWiFi(char* cmd){
 #ifdef DEBUGMODE
-  unsigned long time1, timediff;
-#endif
-  float temps[SENSOR_COUNT];
-  byte i;
-  File dataFile;
-
-  lcd.setCursor(CNTCOL, CNTROW);
-  if(wifiDelayCnt < 10) {
-    lcd.print(" ");
-  }
-  lcd.print(wifiDelayCnt);
-  
-  // call sensors.requestTemperatures() to issue a global temperature 
-  // request to all devices on the bus
-
-#ifdef DEBUGMODE
-  printMonit(STR_REQTEMPC);
-  time1 = millis();
-#endif
-
-  sensors.requestTemperatures();
-
-#ifdef DEBUGMODE
-  timediff = millis() - time1;  
-  printMonit(STR_DONE);
-  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_CONVTIME])));
+  strcpy_P(buffer3, (char*)pgm_read_word(&(string_table[STR_SEND])));
   #if defined(A_UNO)
-    monitor.print(buffer);
-    monitor.println(timediff);
+    monitor.print(buffer3);
+    monitor.println(cmd);
   #else
-    Serial.print(buffer);
-    Serial.println(timediff);
+    Serial.print(buffer3);
+    Serial.println(cmd);
   #endif
 #endif
-
-#ifdef DEBUGMODE
-  // print the device information -- debug only
-  for(i = 0; i < SENSOR_COUNT; i++)
-    printData(Thermometer[i]);
+#if defined(A_UNO)
+  Serial.println(cmd);
+#else
+  Serial1.println(cmd);
 #endif
+} 
+ 
 
-  for(i = 0; i < SENSOR_COUNT; i++) {
-    temps[i] = sensors.getTempC(Thermometer[i]);
-    if(i < SENSOR_COUNT - 1) {           // Box 1 to 6 sensors
-      if(temps[i] > tempLimits[i] + TEMPMARGIN || temps[i] < tempLimits[i] - TEMPMARGIN)
-        Alarm(&tAlarms, i, ALARMSET);
-      else
-        Alarm(&tAlarms, i, ALARMCLEAR);
-    } else {                          // ext temp sensor
-      if(abs(temps[i]) > TEMPLIM)
-        Alarm(&tAlarms, i, ALARMSET);
-      else
-        Alarm(&tAlarms, i, ALARMCLEAR);
-    }
+//**************************** updateTemp ***************************
+//
+// Update temp on ThingSpeak over WiFi
+//
+//********************************************************************
+
+void updateTemp(char* fields){
+  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_CIPSTART])));
+  sendWiFi(buffer2);                                                    // Initiate transmission
+  delay(2000);
+  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_ERROR])));    // Check for possible ERROR answer from WiFi module
+#if defined(A_UNO)
+  if(Serial.find(buffer2)){
+#else
+  if(Serial1.find(buffer2)){
+#endif
+    cli();
+    Alarm(&sAlarms, SALWIFI, ALARMSET);                                    // If ERROR at transmission start - raise an alarm
+    sei();
+#ifdef DEBUGMODE
+    printMonit(STR_RECERR);
+#endif
+    return;
   }
-
-  heaterControl(temps);
-  lcdPrint(heaterString(), HEATERCOL, HEATERROW, false);
-
-  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_DATALOG])));
-  if(!SD.exists(buffer)) {
-    strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_HEADERS])));
-  }
-  else {
-    strcpy(buffer, "");
-  }
-  
-//  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_DATETIME])));
-//  strcat(buffer, buffer2);
-
-  cli();
-  strcat(buffer, rtcDate);
-  sei();
-  strcat(buffer, ",");
-  cli();
-  strcat(buffer, rtcTime);
-  sei();
-  
-  // write temperatures to the log
-  //
-  for(i = 0; i < SENSOR_COUNT; i++) {
-    strcat(buffer, ",");
-    strcat(buffer, dtostrf(temps[i], -5, 2, buffer2));
-  }
-
-  // write heater states to the log
-  //
-  for(i = 0; i < SENSOR_COUNT - 1; i++) {
-    strcat(buffer, ",");
-    strcat(buffer, itoa((heater >> i) & 0x01, buffer2, 10));
-  }
-  
-  // open the file. note that only one file can be open at a time,
-  // so you have to close this one before opening another.
-
-  if(logdata > 0) { // log every 2 * DELAY ms
-    logdata = 0;
-    strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_DATALOG])));
-  
-    dataFile = SD.open(buffer2, FILE_WRITE);
-    // if the file is available, write to it:
-    if (dataFile) {
-      dataFile.println(buffer);
-      dataFile.close();
-      cli();
-      Alarm(&sAlarms, SALSD, ALARMCLEAR);
-      sei();
+  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_CIPSEND])));    // If OK build and send the temps update string
+#if defined(A_UNO)
+  Serial.print(buffer2);
+  Serial.println(strlen(fields));
+  if(Serial.find((char*)">")){
+#else
+  Serial1.print(buffer2);
+  Serial1.println(strlen(fields));
+  if(Serial1.find((char*)">")){
+#endif
 #ifdef DEBUGMODE
   #if defined(A_UNO)
-      monitor.println(buffer);
+    monitor.print((char*)">");
+    monitor.print(fields);
   #else
-      Serial.println(buffer);
+    Serial.print((char*)">");
+    Serial.print(fields);
   #endif
 #endif
-    } else {  // if the file isn't open, pop up an error:
-      cli();
-      Alarm(&sAlarms, SALSD, ALARMSET);
-      sei();
-#ifdef DEBUGMODE
-      printMonit(STR_DATALOGERR);
+#if defined(A_UNO)
+    Serial.print(fields);
+#else
+    Serial1.print(fields);
 #endif
-    }
-  } else {
-    logdata++;
+  }else{
+    strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_CIPCLOSE])));
+    sendWiFi(buffer2);
   }
-
-  if(bitRead(sAlarms, SALWIFI) == ALARMSET) {
-    wifiInit(WIFILOOP);   // try to recover wifi
-  }
-  // Update ThingsSpeak every minute
-  if(wifiDelayCnt >= (THINGSPEAKINTERVAL - 2000) / DELAY && bitRead(sAlarms, SALWIFI) == ALARMCLEAR) {
-    wifiDelayCnt = 0;
-
-    strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_GET])));
-    strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_FIELD])));
-    
-    for(i = 0; i < SENSOR_COUNT; i++) {
-      strcat(buffer, buffer2);
-      strcat(buffer, itoa(i + 1, buffer3, 10));
-      strcat(buffer, "=");
-      strcat(buffer, dtostrf(temps[i], -5, 2, buffer3));
-    }
-    strcat(buffer, "\r\n");
+  strcpy_P(buffer2, (char*)pgm_read_word(&(string_table[STR_OK])));
+#if defined(A_UNO)
+  if(Serial.find(buffer2)){
+#else
+  if(Serial1.find(buffer2)){
+#endif
+    cli();
+    Alarm(&sAlarms, SALWIFI, ALARMCLEAR);
+    sei();
 #ifdef DEBUGMODE
-  #if defined(A_UNO)
-    monitor.println(buffer);
-  #else
-    Serial.println(buffer);
-  #endif
-#endif    
-    updateTemp(buffer);
+    printMonit(STR_RECOK);
+#endif
+  }else{
+    cli();
+    Alarm(&sAlarms, SALWIFI, ALARMSET);
+    sei();
+#ifdef DEBUGMODE
+    printMonit(STR_RECERR);
+#endif
   }
-
-  tAlarmPrint();
-  sAlarmPrint();
-  
-  if(buzzDelayCnt == 0 && (tAlarms != 0 || sAlarms != 0)) {
-    digitalWrite(BUZZERPIN, HIGH);
-  }
-  if(tAlarms != 0 || sAlarms != 0) {
-    buzzDelayCnt++;         // increment counter only if any of the alarms is active
-    if(buzzDelayCnt == BUZZERINTERVAL / DELAY)
-      buzzDelayCnt = 0;
-  } else {
-    buzzDelayCnt = 0;
-  }
-  
-  delay(DELAY);
-
-  digitalWrite(BUZZERPIN, LOW);
-
-  wifiDelayCnt++;
-  cnt++;
 }
+ 
 
+
+//*********************************************************************** Heater routines *****************
+
+//****************************** heaterControl ************************
+// 
 void heaterControl(float temps[]) {
   byte i;
   bool result;
@@ -823,6 +1127,8 @@ void heaterControl(float temps[]) {
   }
 }
 
+//****************************** heaterString *************************
+// 
 char* heaterString() {
   byte i, heater2;
 
@@ -840,6 +1146,13 @@ char* heaterString() {
   return buffer3;
 }
 
+
+
+//************************************************************************ Alarm routines *****************
+
+
+//****************************** Alarm ********************************
+// 
 void Alarm(byte* alarmvar, byte bitpos, byte action) {
   if(action == ALARMSET) {
     bitSet(*alarmvar, bitpos);
@@ -848,6 +1161,9 @@ void Alarm(byte* alarmvar, byte bitpos, byte action) {
   }
 }
 
+
+//****************************** tAlarmPrint **************************
+// 
 void tAlarmPrint() {
   strcpy(alarmStr, "");
   for(byte i = 0; i <= T7AL; i++) {
@@ -860,6 +1176,8 @@ void tAlarmPrint() {
   lcd.print(alarmStr);
 }
 
+//****************************** sAlarmPrint **************************
+// 
 void sAlarmPrint() {
   strcpy(alarmStr, "");
   if(bitRead(sAlarms, SALLCD))
@@ -886,70 +1204,12 @@ void sAlarmPrint() {
   lcd.print(alarmStr);  
 }
 
-void wifiInit(byte mode) {
 
-//  wifiRST();
-  
-  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_AT])));
-  sendDebug1(buffer);
-  
-  delay(5000);
+//************************************************************************** RTC routines *****************
 
-  strcpy_P(buffer, (char*)pgm_read_word(&(string_table[STR_OK])));
-#if defined(A_UNO)
-  if(Serial.find("OK")){
-#else
-  if(Serial1.find("OK")){
-#endif
-#ifdef DEBUGMODE
-    printMonit(STR_RECOK);
-#endif
-    if(connectWiFi()) {
-      if(mode == WIFISETUP)
-        lcdMonit(STR_WIFIOK, 0, 0, true);
-      cli();
-      Alarm(&sAlarms, SALWIFI, ALARMCLEAR);
-      sei();
-#ifdef DEBUGMODE
-      printMonit(STR_WIFIOK);
-#endif  
-    } else {
-      if(mode == WIFISETUP)
-        lcdMonit(STR_WIFIERR, 0, 0, true);
-      cli();
-      Alarm(&sAlarms, SALWIFI, ALARMSET);
-      sei();
-#ifdef DEBUGMODE
-      printMonit(STR_WIFIERR);
-#endif  
-    }
-  } else {
-    if(mode == WIFISETUP)
-      lcdMonit(STR_WIFIERR, 0, 0, true);
-    cli();
-    Alarm(&sAlarms, SALWIFI, ALARMSET);
-    sei();
-#ifdef DEBUGMODE
-    printMonit(STR_WIFIERR);
-#endif
-  }  
-}
-
-void wifiRST() {
-  pinMode(WIFIRSTPIN, OUTPUT);
-  digitalWrite(WIFIRSTPIN, LOW);
-  delay(500);
-  digitalWrite(WIFIRSTPIN, HIGH);
-  delay(2000);
-}
-
-void print2digits(char* buf, int number) {
-  if (number >= 0 && number < 10) {
-    strcat(buf, "0");
-  }
-  strcat(buf, itoa(number, buffer3, 10));
-}
-
+//************************ RTCSquareWave *****************************
+// Program the RTC's SQW output
+//
 void RTCSquareWave(byte rate) {
   byte ctrlreg;
 
@@ -1001,6 +1261,13 @@ void RTCSquareWave(byte rate) {
    }
 }
 
+
+//**************************************************************** SQW Interrupt routine ******************
+
+//*************************** int_sqw *********************************
+// SQW-triggered interrupt handling routine
+// triggered every 1 second
+//
 void int_sqw() {
   tmElements_t tm;
 
@@ -1021,7 +1288,7 @@ void int_sqw() {
 
     lcdPrint(rtcTime, TIMECOL, TIMEROW, false);
     Alarm(&sAlarms, SALRTC, ALARMCLEAR);
-  } else {
+  } else {      // time not set
     if (RTC.chipPresent()) {
 #ifdef DEBUGMODE
   #if defined(A_UNO)
@@ -1034,7 +1301,7 @@ void int_sqw() {
       Serial.println();
   #endif
 #endif
-    } else {
+    } else {      // don't see the RTC module
 #ifdef DEBUGMODE
   #if defined(A_UNO)
       monitor.println(F("DS1307 read error!  Please check the circuitry."));
@@ -1045,7 +1312,17 @@ void int_sqw() {
   #endif
 #endif
     }
-    Alarm(&sAlarms, SALRTC, ALARMSET);
+    Alarm(&sAlarms, SALRTC, ALARMSET);      // Display RTC alarm if time not set
   }
+}
+
+
+//****************************** print2digits *************************
+// 
+void print2digits(char* buf, int number) {
+  if (number >= 0 && number < 10) {
+    strcat(buf, "0");
+  }
+  strcat(buf, itoa(number, buffer3, 10));
 }
 
