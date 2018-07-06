@@ -19,6 +19,8 @@
  * Display module attached to I2C via PFC8574 (address 0x39)
  * Heater control attached to I2C via PFC8574 (address 0x38)
  * RTC (DS1307) attached to I2C (address 0x68)
+ *  SCL - pin 19 (21)
+ *  SDA - pin 18 (20)
  * 
  * SW Serial Monitor via FTDI Serial-USB board (9600 8-N-1) - if using Arduino Uno
  ** RX - pin 9
@@ -63,7 +65,7 @@
  *    R - RTC error
  *    
  * Beeper 
- ** pin 3
+ ** pin 4
  *
  * HW setup
  * ========
@@ -204,7 +206,7 @@ DeviceAddress Thermometer[SENSOR_COUNT] = { { 0x28, 0xF9, 0x34, 0x4A, 0x8, 0x0, 
 //
 #define WIFISETUP   0
 #define WIFILOOP    1
-#define WIFIRSTPIN  3   // pin number to which WiFi module RST input is connected
+#define WIFIRSTPIN  5   // pin number to which WiFi module RST input is connected
 
 // RTC stuff
 //
@@ -212,8 +214,7 @@ DeviceAddress Thermometer[SENSOR_COUNT] = { { 0x28, 0xF9, 0x34, 0x4A, 0x8, 0x0, 
 #define CONTROLREG 0x07
 #define RTC_SQWE      4
 #define SQ_1HZ     0x00
-#define SQW_INT_PIN   3   // SQ will drive the INT1 interrupt (pin 3)
-
+#define SQW_INT_PIN 3   // SQ will drive the INT1 interrupt pin 3 on UNO and MEGA)
 
 char rtcTime[9], rtcDate[11];    // updated in the int_sqw() interrupt routine
 
